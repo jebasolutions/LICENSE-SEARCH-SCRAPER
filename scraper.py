@@ -17,6 +17,7 @@ Variables de entorno requeridas (en Railway):
 import os
 import time
 import logging
+import sqlite3
 import requests
 import pandas as pd
 import schedule
@@ -39,11 +40,54 @@ GHL_LOCATION_ID = os.environ.get("GHL_LOCATION_ID", "")
 CSV_URL = "https://www.myfloridacfo.com/downloads/AAS/LicenseeSearch/AllValidLicensesIndividual.csv"
  
 # ── Configuración ─────────────────────────────────────────────────────────────
-TAGS_GHL   = ["RECRUIT AUTOMATICO"]
-SOURCE_GHL = "LICENSE SEARCH"
+TAGS_GHL    = ["RECRUIT AUTOMATICO"]
+SOURCE_GHL  = "LICENSE SEARCH"
+DB_PATH     = "/app/procesados.db"
  
 # Palabras clave para filtrar Life & Annuity
 FILTRO_LIFE = ["life", "annuity", "2-14", "2-15", "2-16"]
+ 
+ 
+# =============================================================================
+#  BASE DE DATOS — Guarda los agentes ya enviados para no repetirlos
+# =============================================================================
+def iniciar_db():
+    """Crea la base de datos si no existe."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS enviados (
+            licencia TEXT PRIMARY KEY,
+            fecha    TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+    total = contar_enviados()
+    log.info(f"📂 Base de datos lista — {total:,} agentes ya procesados anteriormente")
+ 
+def ya_fue_enviado(licencia: str) -> bool:
+    """Devuelve True si este número de licencia ya fue enviado a GHL."""
+    conn = sqlite3.connect(DB_PATH)
+    cur  = conn.execute("SELECT 1 FROM enviados WHERE licencia = ?", (licencia,))
+    existe = cur.fetchone() is not None
+    conn.close()
+    return existe
+ 
+def marcar_enviado(licencia: str):
+    """Guarda el número de licencia en la base de datos."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "INSERT OR IGNORE INTO enviados (licencia, fecha) VALUES (?, ?)",
+        (licencia, datetime.now().strftime("%Y-%m-%d"))
+    )
+    conn.commit()
+    conn.close()
+ 
+def contar_enviados() -> int:
+    conn  = sqlite3.connect(DB_PATH)
+    total = conn.execute("SELECT COUNT(*) FROM enviados").fetchone()[0]
+    conn.close()
+    return total
  
  
 # =============================================================================
@@ -87,60 +131,83 @@ def descargar_csv():
  
  
 # =============================================================================
-#  FUNCIÓN 3 — Procesar y filtrar el CSV
+#  FUNCIÓN 3 — Procesar y enviar el CSV en pedazos (para no agotar memoria)
 # =============================================================================
-def procesar_csv(texto_csv: str):
-    log.info("🧹 Procesando CSV...")
-    try:
-        df = pd.read_csv(StringIO(texto_csv), dtype=str, low_memory=False)
-    except Exception as e:
-        log.error(f"❌ No se pudo leer el CSV: {e}")
-        return None
+def procesar_y_enviar_csv(texto_csv: str):
+    log.info("🧹 Procesando CSV en pedazos pequeños...")
  
-    log.info(f"   Total filas: {len(df):,}")
-    log.info(f"   Columnas: {list(df.columns)}")
+    # Leer solo las primeras líneas para detectar columnas
+    primera_linea = texto_csv.split("\n")[0]
+    columnas_raw  = primera_linea.strip().split(",")
+    columnas      = [c.strip().strip('"').lower() for c in columnas_raw]
+    log.info(f"   Columnas detectadas: {columnas}")
  
-    # Normalizar columnas
-    df.columns = df.columns.str.strip().str.lower()
+    # Identificar índices de columnas importantes
+    col_nombre = next((c for c in ["licensee name", "name", "agent name", "full name", "individual name"] if c in columnas), None)
+    col_tipo   = next((c for c in ["license type", "type", "license_type", "lic type", "category"] if c in columnas), None)
+    col_email  = next((c for c in ["email", "email address", "e-mail"] if c in columnas), None)
+    col_phone  = next((c for c in ["phone", "phone number", "telephone"] if c in columnas), None)
  
-    # Buscar columna de nombre
-    col_nombre = None
-    for c in ["licensee name", "name", "agent name", "full name", "individual name"]:
-        if c in df.columns:
-            col_nombre = c
-            break
+    if not col_nombre:
+        log.error(f"❌ No encontré columna de nombre. Columnas: {columnas}")
+        return 0, 0
  
-    if col_nombre is None:
-        log.error(f"❌ No encontré columna de nombre. Columnas: {list(df.columns)}")
-        return None
+    enviados = 0
+    fallidos = 0
+    total_procesadas = 0
  
-    # Buscar columna de tipo de licencia
-    col_tipo = None
-    for c in ["license type", "type", "license_type", "lic type", "category"]:
-        if c in df.columns:
-            col_tipo = c
-            break
+    # Procesar en pedazos de 5,000 filas para no usar mucha memoria
+    CHUNK = 5000
+    for chunk in pd.read_csv(StringIO(texto_csv), dtype=str, low_memory=False, chunksize=CHUNK):
  
-    # Filtrar por Life & Annuity
-    if col_tipo:
-        df[col_tipo] = df[col_tipo].str.strip().str.lower().fillna("")
-        mask = df[col_tipo].apply(lambda t: any(f in t for f in FILTRO_LIFE))
-        df = df[mask]
-        log.info(f"   Después de filtrar Life & Annuity: {len(df):,} filas")
-    else:
-        log.warning("⚠️  No encontré columna de tipo. Usando todos los registros.")
+        # Normalizar columnas del chunk
+        chunk.columns = chunk.columns.str.strip().str.lower()
  
-    # Separar nombre
-    df[["first_name", "last_name"]] = df[col_nombre].apply(
-        lambda n: pd.Series(separar_nombre(n))
-    )
+        # Filtrar por Life & Annuity
+        if col_tipo and col_tipo in chunk.columns:
+            chunk[col_tipo] = chunk[col_tipo].str.strip().str.lower().fillna("")
+            chunk = chunk[chunk[col_tipo].apply(lambda t: any(f in t for f in FILTRO_LIFE))]
  
-    # Columnas opcionales
-    col_email = next((c for c in ["email", "email address", "e-mail"] if c in df.columns), None)
-    col_phone = next((c for c in ["phone", "phone number", "telephone"] if c in df.columns), None)
+        if chunk.empty:
+            total_procesadas += CHUNK
+            continue
  
-    log.info(f"✅ Listos para enviar: {len(df):,} contactos")
-    return df, col_email, col_phone
+        # Buscar columna de número de licencia (identificador único)
+        col_licencia = next((c for c in ["license number", "fl license #", "license #", "lic #", "license_number"] if c in chunk.columns), None)
+ 
+        # Separar nombre y enviar cada contacto
+        for _, fila in chunk.iterrows():
+            # Obtener el número de licencia como ID único
+            licencia = str(fila.get(col_licencia, "")).strip() if col_licencia else ""
+ 
+            # Si ya fue enviado antes, saltarlo
+            if licencia and ya_fue_enviado(licencia):
+                continue
+ 
+            nombre_completo = fila.get(col_nombre, "")
+            first_name, last_name = separar_nombre(nombre_completo)
+ 
+            if not first_name and not last_name:
+                continue
+ 
+            email = fila.get(col_email, "") if col_email else ""
+            phone = fila.get(col_phone, "") if col_phone else ""
+ 
+            exito = enviar_a_ghl(first_name, last_name, email, phone)
+            if exito:
+                enviados += 1
+                # Guardar en base de datos para no repetir
+                if licencia:
+                    marcar_enviado(licencia)
+            else:
+                fallidos += 1
+ 
+            time.sleep(0.2)
+ 
+        total_procesadas += CHUNK
+        log.info(f"   → Procesadas: {total_procesadas:,} filas | Enviados a GHL: {enviados:,}")
+ 
+    return enviados, fallidos
  
  
 # =============================================================================
@@ -195,35 +262,8 @@ def ejecutar():
     if not texto:
         return
  
-    resultado = procesar_csv(texto)
-    if not resultado:
-        return
- 
-    df, col_email, col_phone = resultado
-    if df.empty:
-        log.warning("⚠️  Sin contactos para enviar.")
-        return
- 
-    enviados = fallidos = 0
-    total = len(df)
-    log.info(f"📤 Enviando {total:,} contactos a GHL...")
- 
-    for _, fila in df.iterrows():
-        exito = enviar_a_ghl(
-            first_name = fila.get("first_name", ""),
-            last_name  = fila.get("last_name", ""),
-            email      = fila.get(col_email, "") if col_email else "",
-            phone      = fila.get(col_phone, "") if col_phone else "",
-        )
-        if exito:
-            enviados += 1
-        else:
-            fallidos += 1
- 
-        time.sleep(0.3)
- 
-        if (enviados + fallidos) % 100 == 0:
-            log.info(f"   → Progreso: {enviados + fallidos:,}/{total:,}")
+    enviados, fallidos = procesar_y_enviar_csv(texto)
+    del texto  # liberar memoria inmediatamente
  
     log.info("=" * 60)
     log.info(f"✅ Ciclo terminado — Enviados: {enviados:,} | Fallidos: {fallidos:,}")
@@ -235,6 +275,7 @@ def ejecutar():
 # =============================================================================
 if __name__ == "__main__":
     log.info("🤖 Robot de Florida iniciado.")
+    iniciar_db()
  
     ejecutar()
  
