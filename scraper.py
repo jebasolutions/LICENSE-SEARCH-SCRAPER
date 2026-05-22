@@ -185,15 +185,22 @@ def procesar_y_enviar_csv(ruta_csv: str):
     columnas     = [c.strip().strip('"').lower() for c in columnas_raw]
     log.info(f"   Columnas detectadas: {columnas}")
 
-    # Identificar columnas importantes
-    col_nombre = next((c for c in ["licensee name", "name", "agent name", "full name", "individual name"] if c in columnas), None)
-    col_tipo   = next((c for c in ["license type", "type", "license_type", "lic type", "category"] if c in columnas), None)
-    col_email  = next((c for c in ["email", "email address", "e-mail"] if c in columnas), None)
-    col_phone  = next((c for c in ["phone", "phone number", "telephone"] if c in columnas), None)
+    # Columnas exactas del CSV de Florida
+    col_first   = next((c for c in ["first name", "firstname", "first_name"] if c in columnas), None)
+    col_last    = next((c for c in ["last name", "lastname", "last_name"] if c in columnas), None)
+    col_tipo    = next((c for c in ["license tycl desc", "license type", "license_type", "lic type"] if c in columnas), None)
+    col_email   = next((c for c in ["email address", "email", "e-mail"] if c in columnas), None)
+    col_phone   = next((c for c in ["business phone", "phone", "phone number"] if c in columnas), None)
+    col_address = next((c for c in ["business address1", "business address", "address"] if c in columnas), None)
+    col_city    = next((c for c in ["business city", "city"] if c in columnas), None)
+    col_county  = next((c for c in ["business county", "county"] if c in columnas), None)
+    col_npn     = next((c for c in ["npn number", "npn"] if c in columnas), None)
 
-    if not col_nombre:
-        log.error(f"❌ No encontré columna de nombre. Columnas: {columnas}")
+    if not col_first and not col_last:
+        log.error(f"❌ No encontré columnas de nombre. Columnas: {columnas}")
         return 0, 0
+
+    log.info(f"   ✅ Columnas mapeadas — Nombre: '{col_first}' '{col_last}' | Tipo: '{col_tipo}' | Email: '{col_email}'")
 
     enviados = 0
     fallidos = 0
@@ -216,24 +223,26 @@ def procesar_y_enviar_csv(ruta_csv: str):
             total_procesadas += CHUNK
             continue
 
-        # Buscar todas las columnas relevantes
-        col_licencia = next((c for c in ["license number", "fl license #", "license #", "lic #", "license_number"] if c in chunk.columns), None)
-        col_address  = next((c for c in ["business address", "address", "address1", "street"] if c in chunk.columns), None)
-        col_city     = next((c for c in ["city", "business city"] if c in chunk.columns), None)
-        col_county   = next((c for c in ["county", "business county"] if c in chunk.columns), None)
-        col_npn      = next((c for c in ["npn", "national producer number"] if c in chunk.columns), None)
+        col_licencia = "license number" if "license number" in chunk.columns else None
 
-        # Separar nombre y enviar cada contacto
+        # Filtrar por Life & Annuity en este chunk
+        if col_tipo and col_tipo in chunk.columns:
+            chunk[col_tipo] = chunk[col_tipo].str.strip().str.lower().fillna("")
+            chunk = chunk[chunk[col_tipo].apply(lambda t: any(f in t for f in FILTRO_LIFE))]
+
+        if chunk.empty:
+            total_procesadas += CHUNK
+            continue
+
+        # Enviar cada contacto
         for _, fila in chunk.iterrows():
-            # Número de licencia como ID único
             licencia = str(fila.get(col_licencia, "")).strip() if col_licencia else ""
 
-            # Si ya fue enviado antes, saltarlo
             if licencia and ya_fue_enviado(licencia):
                 continue
 
-            nombre_completo = fila.get(col_nombre, "")
-            first_name, last_name = separar_nombre(nombre_completo)
+            first_name = str(fila.get(col_first, "")).strip().title() if col_first else ""
+            last_name  = str(fila.get(col_last,  "")).strip().title() if col_last  else ""
 
             if not first_name and not last_name:
                 continue
@@ -311,11 +320,13 @@ def enviar_a_ghl(first_name, last_name, email="", phone="",
 
     try:
         resp = requests.post(
-            "https://rest.gohighlevel.com/v1/contacts/",
+            "https://services.leadconnectorhq.com/contacts/",
             json=payload,
             headers=headers,
             timeout=30
         )
+        if resp.status_code not in (200, 201, 422):
+            log.warning(f"   GHL respondió {resp.status_code}: {resp.text[:200]}")
         return resp.status_code in (200, 201, 422)
     except Exception as e:
         log.error(f"❌ Error enviando a GHL: {e}")
