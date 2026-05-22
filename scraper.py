@@ -7,13 +7,13 @@
   2. Filtra solo licencias Life & Annuity
   3. Separa nombres: "APELLIDO, NOMBRE" → first_name / last_name
   4. Manda cada contacto a GHL con tag 'RECRUIT AUTOMATICO' y source 'LICENSE SEARCH'
- 
+
 Variables de entorno requeridas (en Railway):
   GHL_API_KEY       → tu API key de GoHighLevel
   GHL_LOCATION_ID   → el ID de tu location en GHL
 =============================================================
 """
- 
+
 import os
 import time
 import logging
@@ -22,7 +22,7 @@ import requests
 import pandas as pd
 import schedule
 from datetime import datetime
- 
+
 # ── Logs ──────────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
@@ -30,23 +30,23 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger(__name__)
- 
+
 # ── Credenciales GHL ──────────────────────────────────────────────────────────
 GHL_API_KEY     = os.environ.get("GHL_API_KEY", "")
 GHL_LOCATION_ID = os.environ.get("GHL_LOCATION_ID", "")
- 
+
 # ── URL directa del CSV de Florida (sin necesidad de browser) ─────────────────
 CSV_URL = "https://www.myfloridacfo.com/downloads/AAS/LicenseeSearch/AllValidLicensesIndividual.csv"
- 
+
 # ── Configuración ─────────────────────────────────────────────────────────────
 TAGS_GHL    = ["IUL", "RECRUIT AUTOMATICO"]
 SOURCE_GHL  = "LICENSE SEARCH"
 DB_PATH     = "/app/procesados.db"
- 
+
 # Palabras clave para filtrar Life & Annuity
 FILTRO_LIFE = ["life", "annuity", "2-14", "2-15", "2-16"]
- 
- 
+
+
 # =============================================================================
 #  BASE DE DATOS — Guarda los agentes ya enviados para no repetirlos
 # =============================================================================
@@ -63,7 +63,7 @@ def iniciar_db():
     conn.close()
     total = contar_enviados()
     log.info(f"📂 Base de datos lista — {total:,} agentes ya procesados anteriormente")
- 
+
 def ya_fue_enviado(licencia: str) -> bool:
     """Devuelve True si este número de licencia ya fue enviado a GHL."""
     conn = sqlite3.connect(DB_PATH)
@@ -71,7 +71,7 @@ def ya_fue_enviado(licencia: str) -> bool:
     existe = cur.fetchone() is not None
     conn.close()
     return existe
- 
+
 def marcar_enviado(licencia: str):
     """Guarda el número de licencia en la base de datos."""
     conn = sqlite3.connect(DB_PATH)
@@ -81,14 +81,14 @@ def marcar_enviado(licencia: str):
     )
     conn.commit()
     conn.close()
- 
+
 def contar_enviados() -> int:
     conn  = sqlite3.connect(DB_PATH)
     total = conn.execute("SELECT COUNT(*) FROM enviados").fetchone()[0]
     conn.close()
     return total
- 
- 
+
+
 # =============================================================================
 #  FUNCIÓN 1 — Separar nombre
 #  El CSV trae: "GARCIA LOPEZ, ANA MARIA"
@@ -104,13 +104,13 @@ def separar_nombre(nombre_completo: str):
         last_name  = nombre_completo.title()
         first_name = ""
     return first_name, last_name
- 
- 
+
+
 # =============================================================================
 #  FUNCIÓN 2 — Descargar CSV directo al disco (nunca en memoria completa)
 # =============================================================================
 CSV_LOCAL = "/tmp/florida.csv"
- 
+
 def descargar_csv():
     log.info("📥 Descargando CSV de Florida al disco...")
     headers = {
@@ -120,90 +120,124 @@ def descargar_csv():
             "Chrome/124.0.0.0 Safari/537.36"
         )
     }
-    try:
-        with requests.get(CSV_URL, headers=headers, timeout=300, stream=True) as resp:
-            resp.raise_for_status()
-            bytes_descargados = 0
-            with open(CSV_LOCAL, "wb") as f:
-                for pedazo in resp.iter_content(chunk_size=1024 * 1024):  # 1MB a la vez
-                    f.write(pedazo)
-                    bytes_descargados += len(pedazo)
- 
-        mb = bytes_descargados / 1024 / 1024
-        log.info(f"✅ CSV guardado en disco — {mb:.1f} MB")
-        return CSV_LOCAL
-    except Exception as e:
-        log.error(f"❌ Error al descargar CSV: {e}")
-        return None
- 
- 
+
+    MAX_INTENTOS = 5
+    for intento in range(1, MAX_INTENTOS + 1):
+        try:
+            # Ver cuánto ya descargamos (para continuar desde donde se quedó)
+            bytes_ya_descargados = os.path.getsize(CSV_LOCAL) if os.path.exists(CSV_LOCAL) else 0
+
+            if bytes_ya_descargados > 0:
+                mb_ya = bytes_ya_descargados / 1024 / 1024
+                log.info(f"   Intento {intento}/{MAX_INTENTOS} — continuando desde {mb_ya:.1f} MB...")
+                headers["Range"] = f"bytes={bytes_ya_descargados}-"
+                modo_archivo = "ab"  # append — agrega al final
+            else:
+                log.info(f"   Intento {intento}/{MAX_INTENTOS} — descargando desde cero...")
+                modo_archivo = "wb"  # write — empieza de cero
+
+            with requests.get(CSV_URL, headers=headers, timeout=600, stream=True) as resp:
+                # 206 = servidor acepta continuar desde donde nos quedamos
+                # 200 = servidor manda todo desde cero
+                if resp.status_code == 200 and bytes_ya_descargados > 0:
+                    log.info("   El servidor no soporta continuar — descargando desde cero...")
+                    modo_archivo = "wb"
+                    bytes_ya_descargados = 0
+                elif resp.status_code not in (200, 206):
+                    resp.raise_for_status()
+
+                bytes_nuevos = 0
+                with open(CSV_LOCAL, modo_archivo) as f:
+                    for pedazo in resp.iter_content(chunk_size=512 * 1024):
+                        if pedazo:
+                            f.write(pedazo)
+                            bytes_nuevos += len(pedazo)
+
+            total_mb = (bytes_ya_descargados + bytes_nuevos) / 1024 / 1024
+            log.info(f"✅ CSV guardado en disco — {total_mb:.1f} MB totales")
+            return CSV_LOCAL
+
+        except Exception as e:
+            log.warning(f"   ⚠️ Intento {intento} fallido: {e}")
+            if intento < MAX_INTENTOS:
+                espera = intento * 30
+                log.info(f"   ⏳ Esperando {espera}s y continuando desde donde se quedó...")
+                time.sleep(espera)
+            else:
+                log.error("❌ No se pudo descargar el CSV después de 5 intentos.")
+                # Borrar archivo incompleto
+                if os.path.exists(CSV_LOCAL):
+                    os.remove(CSV_LOCAL)
+                return None
+
+
 # =============================================================================
 #  FUNCIÓN 3 — Procesar y enviar el CSV en pedazos (para no agotar memoria)
 # =============================================================================
 def procesar_y_enviar_csv(ruta_csv: str):
     log.info("🧹 Procesando CSV desde disco en pedazos pequeños...")
- 
+
     # Leer primera línea para detectar columnas (sin cargar todo el archivo)
     with open(ruta_csv, "r", encoding="utf-8", errors="ignore") as f:
         primera_linea = f.readline()
- 
+
     columnas_raw = primera_linea.strip().split(",")
     columnas     = [c.strip().strip('"').lower() for c in columnas_raw]
     log.info(f"   Columnas detectadas: {columnas}")
- 
+
     # Identificar columnas importantes
     col_nombre = next((c for c in ["licensee name", "name", "agent name", "full name", "individual name"] if c in columnas), None)
     col_tipo   = next((c for c in ["license type", "type", "license_type", "lic type", "category"] if c in columnas), None)
     col_email  = next((c for c in ["email", "email address", "e-mail"] if c in columnas), None)
     col_phone  = next((c for c in ["phone", "phone number", "telephone"] if c in columnas), None)
- 
+
     if not col_nombre:
         log.error(f"❌ No encontré columna de nombre. Columnas: {columnas}")
         return 0, 0
- 
+
     enviados = 0
     fallidos = 0
     total_procesadas = 0
- 
+
     # Leer directamente del archivo en disco — 5,000 filas a la vez
     CHUNK = 5000
     for chunk in pd.read_csv(ruta_csv, dtype=str, low_memory=False,
                               chunksize=CHUNK, encoding="utf-8", on_bad_lines="skip"):
- 
+
         # Normalizar columnas del chunk
         chunk.columns = chunk.columns.str.strip().str.lower()
- 
+
         # Filtrar por Life & Annuity
         if col_tipo and col_tipo in chunk.columns:
             chunk[col_tipo] = chunk[col_tipo].str.strip().str.lower().fillna("")
             chunk = chunk[chunk[col_tipo].apply(lambda t: any(f in t for f in FILTRO_LIFE))]
- 
+
         if chunk.empty:
             total_procesadas += CHUNK
             continue
- 
+
         # Buscar todas las columnas relevantes
         col_licencia = next((c for c in ["license number", "fl license #", "license #", "lic #", "license_number"] if c in chunk.columns), None)
         col_address  = next((c for c in ["business address", "address", "address1", "street"] if c in chunk.columns), None)
         col_city     = next((c for c in ["city", "business city"] if c in chunk.columns), None)
         col_county   = next((c for c in ["county", "business county"] if c in chunk.columns), None)
         col_npn      = next((c for c in ["npn", "national producer number"] if c in chunk.columns), None)
- 
+
         # Separar nombre y enviar cada contacto
         for _, fila in chunk.iterrows():
             # Número de licencia como ID único
             licencia = str(fila.get(col_licencia, "")).strip() if col_licencia else ""
- 
+
             # Si ya fue enviado antes, saltarlo
             if licencia and ya_fue_enviado(licencia):
                 continue
- 
+
             nombre_completo = fila.get(col_nombre, "")
             first_name, last_name = separar_nombre(nombre_completo)
- 
+
             if not first_name and not last_name:
                 continue
- 
+
             exito = enviar_a_ghl(
                 first_name  = first_name,
                 last_name   = last_name,
@@ -215,22 +249,22 @@ def procesar_y_enviar_csv(ruta_csv: str):
                 license_num = licencia,
                 npn         = fila.get(col_npn,     "") if col_npn     else "",
             )
- 
+
             if exito:
                 enviados += 1
                 if licencia:
                     marcar_enviado(licencia)
             else:
                 fallidos += 1
- 
+
             time.sleep(0.2)
- 
+
         total_procesadas += CHUNK
         log.info(f"   → Procesadas: {total_procesadas:,} filas | Enviados a GHL: {enviados:,}")
- 
+
     return enviados, fallidos
- 
- 
+
+
 # =============================================================================
 #  FUNCIÓN 4 — Enviar contacto a GHL con todos los campos
 # =============================================================================
@@ -239,13 +273,13 @@ def enviar_a_ghl(first_name, last_name, email="", phone="",
     if not GHL_API_KEY or not GHL_LOCATION_ID:
         log.error("❌ Faltan credenciales GHL.")
         return False
- 
+
     headers = {
         "Authorization": f"Bearer {GHL_API_KEY}",
         "Content-Type": "application/json",
         "Version": "2021-07-28",
     }
- 
+
     payload = {
         "locationId": GHL_LOCATION_ID,
         "firstName":  str(first_name).strip(),
@@ -253,7 +287,7 @@ def enviar_a_ghl(first_name, last_name, email="", phone="",
         "tags":       TAGS_GHL,
         "source":     SOURCE_GHL,
     }
- 
+
     if email and "@" in str(email):
         payload["email"] = str(email).strip().lower()
     if phone and str(phone).strip():
@@ -262,7 +296,7 @@ def enviar_a_ghl(first_name, last_name, email="", phone="",
         payload["address1"] = str(address).strip().title()
     if city and str(city).strip():
         payload["city"] = str(city).strip().title()
- 
+
     # Campos personalizados: LICENSE, COUNTY, NPN
     custom_fields = []
     if license_num and str(license_num).strip():
@@ -271,10 +305,10 @@ def enviar_a_ghl(first_name, last_name, email="", phone="",
         custom_fields.append({"key": "county", "field_value": str(county).strip().title()})
     if npn and str(npn).strip():
         custom_fields.append({"key": "npn", "field_value": str(npn).strip()})
- 
+
     if custom_fields:
         payload["customFields"] = custom_fields
- 
+
     try:
         resp = requests.post(
             "https://rest.gohighlevel.com/v1/contacts/",
@@ -286,8 +320,8 @@ def enviar_a_ghl(first_name, last_name, email="", phone="",
     except Exception as e:
         log.error(f"❌ Error enviando a GHL: {e}")
         return False
- 
- 
+
+
 # =============================================================================
 #  FUNCIÓN PRINCIPAL
 # =============================================================================
@@ -295,37 +329,37 @@ def ejecutar():
     log.info("=" * 60)
     log.info(f"🚀 Iniciando ciclo — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     log.info("=" * 60)
- 
+
     ruta = descargar_csv()
     if not ruta:
         return
- 
+
     enviados, fallidos = procesar_y_enviar_csv(ruta)
- 
+
     # Borrar el archivo del disco al terminar
     try:
         os.remove(ruta)
         log.info("🗑️  Archivo temporal eliminado del disco")
     except Exception:
         pass
- 
+
     log.info("=" * 60)
     log.info(f"✅ Ciclo terminado — Enviados: {enviados:,} | Fallidos: {fallidos:,}")
     log.info("=" * 60)
- 
- 
+
+
 # =============================================================================
 #  ARRANQUE
 # =============================================================================
 if __name__ == "__main__":
     log.info("🤖 Robot de Florida iniciado.")
     iniciar_db()
- 
+
     ejecutar()
- 
+
     schedule.every().hour.do(ejecutar)
     log.info("⏰ Programado para correr cada hora. Robot en espera...")
- 
+
     while True:
         schedule.run_pending()
         time.sleep(30)
