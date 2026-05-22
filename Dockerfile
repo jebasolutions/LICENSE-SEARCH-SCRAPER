@@ -1,33 +1,35 @@
 FROM python:3.11-slim
 
-# Instala Chrome y dependencias
+# Instalar dependencias del sistema + Chrome (método moderno, sin apt-key)
 RUN apt-get update && apt-get install -y \
     wget \
+    ca-certificates \
     gnupg \
-    unzip \
-    curl \
-    && wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | apt-key add - \
-    && echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google.list \
-    && apt-get update \
-    && apt-get install -y google-chrome-stable \
+    fonts-liberation \
+    libasound2 \
+    libatk-bridge2.0-0 \
+    libatk1.0-0 \
+    libcups2 \
+    libdbus-1-3 \
+    libgdk-pixbuf2.0-0 \
+    libnspr4 \
+    libnss3 \
+    libx11-xcb1 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxrandr2 \
+    xdg-utils \
+    --no-install-recommends \
+    && wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
+    && apt-get install -y ./google-chrome-stable_current_amd64.deb \
+    && rm google-chrome-stable_current_amd64.deb \
     && rm -rf /var/lib/apt/lists/*
 
-# Directorio de trabajo
 WORKDIR /app
 
-# Instala dependencias Python
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Instala ChromeDriver automáticamente
-RUN pip install webdriver-manager
-
-# Copia el código
 COPY . .
 
-# Crea carpetas necesarias
-RUN mkdir -p downloads logs
-
-# Corre el scheduler (espera el lunes 6 AM)
-# Para correr inmediatamente: CMD ["python", "scraper.py"]
-CMD ["python", "scheduler.py"]
+CMD ["python", "scraper.py"]
